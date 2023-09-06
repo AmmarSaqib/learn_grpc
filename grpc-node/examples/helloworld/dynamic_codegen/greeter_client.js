@@ -22,13 +22,14 @@ var parseArgs = require('minimist');
 var grpc = require('@grpc/grpc-js');
 var protoLoader = require('@grpc/proto-loader');
 var packageDefinition = protoLoader.loadSync(
-    PROTO_PATH,
-    {keepCase: true,
-     longs: String,
-     enums: String,
-     defaults: true,
-     oneofs: true
-    });
+  PROTO_PATH,
+  {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true
+  });
 var hello_proto = grpc.loadPackageDefinition(packageDefinition).helloworld;
 
 function main() {
@@ -42,14 +43,17 @@ function main() {
     target = 'localhost:50051';
   }
   var client = new hello_proto.Greeter(target,
-                                       grpc.credentials.createInsecure());
+    grpc.credentials.createInsecure());
   var user;
   if (argv._.length > 0) {
     user = argv._[0];
   } else {
     user = 'world';
   }
-  client.sayHello({name: user}, function(err, response) {
+  client.sayHello({ name: user }, function (err, response) {
+    console.log('Greeting:', response.message);
+  });
+  client.sayHelloAgain({ name: user }, function (err, response) {
     console.log('Greeting:', response.message);
   });
 }
