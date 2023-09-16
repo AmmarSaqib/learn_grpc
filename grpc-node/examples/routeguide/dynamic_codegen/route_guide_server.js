@@ -25,13 +25,14 @@ var _ = require('lodash');
 var grpc = require('@grpc/grpc-js');
 var protoLoader = require('@grpc/proto-loader');
 var packageDefinition = protoLoader.loadSync(
-    PROTO_PATH,
-    {keepCase: true,
-     longs: String,
-     enums: String,
-     defaults: true,
-     oneofs: true
-    });
+  PROTO_PATH,
+  {
+    keepCase: true,
+    longs: String,
+    enums: String,
+    defaults: true,
+    oneofs: true
+  });
 var routeguide = grpc.loadPackageDefinition(packageDefinition).routeguide;
 
 var COORD_FACTOR = 1e7;
@@ -60,7 +61,7 @@ function checkFeature(point) {
   for (var i = 0; i < feature_list.length; i++) {
     feature = feature_list[i];
     if (feature.location.latitude === point.latitude &&
-        feature.location.longitude === point.longitude) {
+      feature.location.longitude === point.longitude) {
       return feature;
     }
   }
@@ -96,14 +97,14 @@ function listFeatures(call) {
   var top = _.max([lo.latitude, hi.latitude]);
   var bottom = _.min([lo.latitude, hi.latitude]);
   // For each feature, check if it is in the given bounding box
-  _.each(feature_list, function(feature) {
+  _.each(feature_list, function (feature) {
     if (feature.name === '') {
       return;
     }
     if (feature.location.longitude >= left &&
-        feature.location.longitude <= right &&
-        feature.location.latitude >= bottom &&
-        feature.location.latitude <= top) {
+      feature.location.longitude <= right &&
+      feature.location.latitude >= bottom &&
+      feature.location.latitude <= top) {
       call.write(feature);
     }
   });
@@ -127,12 +128,12 @@ function getDistance(start, end) {
   var lon1 = toRadians(start.longitude / COORD_FACTOR);
   var lon2 = toRadians(end.longitude / COORD_FACTOR);
 
-  var deltalat = lat2-lat1;
-  var deltalon = lon2-lon1;
-  var a = Math.sin(deltalat/2) * Math.sin(deltalat/2) +
-      Math.cos(lat1) * Math.cos(lat2) *
-      Math.sin(deltalon/2) * Math.sin(deltalon/2);
-  var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  var deltalat = lat2 - lat1;
+  var deltalon = lon2 - lon1;
+  var a = Math.sin(deltalat / 2) * Math.sin(deltalat / 2) +
+    Math.cos(lat1) * Math.cos(lat2) *
+    Math.sin(deltalon / 2) * Math.sin(deltalon / 2);
+  var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
 }
 
@@ -151,7 +152,7 @@ function recordRoute(call, callback) {
   var previous = null;
   // Start a timer
   var start_time = process.hrtime();
-  call.on('data', function(point) {
+  call.on('data', function (point) {
     point_count += 1;
     if (checkFeature(point).name !== '') {
       feature_count += 1;
@@ -163,12 +164,12 @@ function recordRoute(call, callback) {
     }
     previous = point;
   });
-  call.on('end', function() {
+  call.on('end', function () {
     callback(null, {
       point_count: point_count,
       feature_count: feature_count,
       // Cast the distance to an integer
-      distance: distance|0,
+      distance: distance | 0,
       // End the timer
       elapsed_time: process.hrtime(start_time)[0]
     });
@@ -192,12 +193,12 @@ function pointKey(point) {
  * @param {Duplex} call The stream for incoming and outgoing messages
  */
 function routeChat(call) {
-  call.on('data', function(note) {
+  call.on('data', function (note) {
     var key = pointKey(note.location);
     /* For each note sent, respond with all previous notes that correspond to
      * the same point */
     if (route_notes.hasOwnProperty(key)) {
-      _.each(route_notes[key], function(note) {
+      _.each(route_notes[key], function (note) {
         call.write(note);
       });
     } else {
@@ -206,7 +207,7 @@ function routeChat(call) {
     // Then add the new note to the list
     route_notes[key].push(JSON.parse(JSON.stringify(note)));
   });
-  call.on('end', function() {
+  call.on('end', function () {
     call.end();
   });
 }
@@ -234,7 +235,7 @@ if (require.main === module) {
     var argv = parseArgs(process.argv, {
       string: 'db_path'
     });
-    fs.readFile(path.resolve(argv.db_path), function(err, data) {
+    fs.readFile(path.resolve(argv.db_path), function (err, data) {
       if (err) throw err;
       feature_list = JSON.parse(data);
       routeServer.start();
