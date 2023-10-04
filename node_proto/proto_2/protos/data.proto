@@ -1,0 +1,12 @@
+syntax = "proto3";
+import "google/protobuf/struct.proto";
+
+service MessageSender {
+  rpc SendData (MessageData) returns (Void);
+}
+
+message Void {}
+
+message MessageData {
+  google.protobuf.Struct data = 1;
+}

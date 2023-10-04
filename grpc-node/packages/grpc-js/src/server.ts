@@ -631,12 +631,15 @@ export class Server {
 
     const resolverListener: ResolverListener = {
       onSuccessfulResolution: (
-        addressList,
+        endpointList,
         serviceConfig,
         serviceConfigError
       ) => {
         // We only want one resolution result. Discard all future results
         resolverListener.onSuccessfulResolution = () => {};
+        const addressList = ([] as SubchannelAddress[]).concat(
+          ...endpointList.map(endpoint => endpoint.addresses)
+        );
         if (addressList.length === 0) {
           deferredCallback(
             new Error(`No addresses resolved for port ${port}`),
@@ -1079,8 +1082,8 @@ export class Server {
         );
         this.sessionChildrenTracker.refChild(channelzRef);
       }
-      let connectionAgeTimer: NodeJS.Timer | null = null;
-      let connectionAgeGraceTimer: NodeJS.Timer | null = null;
+      let connectionAgeTimer: NodeJS.Timeout | null = null;
+      let connectionAgeGraceTimer: NodeJS.Timeout | null = null;
       let sessionClosedByServer = false;
       if (this.maxConnectionAgeMs !== UNLIMITED_CONNECTION_AGE_MS) {
         // Apply a random jitter within a +/-10% range
@@ -1115,7 +1118,7 @@ export class Server {
           }
         }, this.maxConnectionAgeMs + jitter).unref?.();
       }
-      const keeapliveTimeTimer: NodeJS.Timer | null = setInterval(() => {
+      const keeapliveTimeTimer: NodeJS.Timeout | null = setInterval(() => {
         const timeoutTImer = setTimeout(() => {
           sessionClosedByServer = true;
           if (this.channelzEnabled) {

@@ -19,37 +19,34 @@ import * as protoLoader from '@grpc/proto-loader';
 import { RE2 } from 're2-wasm';
 
 import { getSingletonXdsClient, Watcher, XdsClient } from './xds-client';
-import { StatusObject, status, logVerbosity, Metadata, experimental, ChannelOptions } from '@grpc/grpc-js';
+import { StatusObject, status, logVerbosity, Metadata, experimental, ChannelOptions, ServiceConfig, LoadBalancingConfig, RetryPolicy } from '@grpc/grpc-js';
 import Resolver = experimental.Resolver;
 import GrpcUri = experimental.GrpcUri;
 import ResolverListener = experimental.ResolverListener;
 import uriToString = experimental.uriToString;
-import ServiceConfig = experimental.ServiceConfig;
 import registerResolver = experimental.registerResolver;
 import { Listener__Output } from './generated/envoy/config/listener/v3/Listener';
 import { RouteConfiguration__Output } from './generated/envoy/config/route/v3/RouteConfiguration';
 import { HttpConnectionManager__Output } from './generated/envoy/extensions/filters/network/http_connection_manager/v3/HttpConnectionManager';
-import { CdsLoadBalancingConfig } from './load-balancer-cds';
 import { VirtualHost__Output } from './generated/envoy/config/route/v3/VirtualHost';
 import { RouteMatch__Output } from './generated/envoy/config/route/v3/RouteMatch';
 import { HeaderMatcher__Output } from './generated/envoy/config/route/v3/HeaderMatcher';
 import ConfigSelector = experimental.ConfigSelector;
-import LoadBalancingConfig = experimental.LoadBalancingConfig;
-import { XdsClusterManagerLoadBalancingConfig } from './load-balancer-xds-cluster-manager';
 import { ContainsValueMatcher, ExactValueMatcher, FullMatcher, HeaderMatcher, Matcher, PathExactValueMatcher, PathPrefixValueMatcher, PathSafeRegexValueMatcher, PrefixValueMatcher, PresentValueMatcher, RangeValueMatcher, RejectValueMatcher, SafeRegexValueMatcher, SuffixValueMatcher, ValueMatcher } from './matcher';
 import { envoyFractionToFraction, Fraction } from "./fraction";
-import { RouteAction, SingleClusterRouteAction, WeightedCluster, WeightedClusterRouteAction } from './route-action';
+import { HashPolicy, RouteAction, SingleClusterRouteAction, WeightedCluster, WeightedClusterRouteAction } from './route-action';
 import { decodeSingleResource, HTTP_CONNECTION_MANGER_TYPE_URL } from './resources';
 import Duration = experimental.Duration;
 import { Duration__Output } from './generated/google/protobuf/Duration';
 import { createHttpFilter, HttpFilterConfig, parseOverrideFilterConfig, parseTopLevelFilterConfig } from './http-filter';
-import { EXPERIMENTAL_FAULT_INJECTION, EXPERIMENTAL_FEDERATION, EXPERIMENTAL_RETRY } from './environment';
+import { EXPERIMENTAL_FAULT_INJECTION, EXPERIMENTAL_FEDERATION, EXPERIMENTAL_RETRY, EXPERIMENTAL_RING_HASH } from './environment';
 import Filter = experimental.Filter;
 import FilterFactory = experimental.FilterFactory;
-import RetryPolicy = experimental.RetryPolicy;
 import { BootstrapInfo, loadBootstrapInfo, validateBootstrapConfig } from './xds-bootstrap';
 import { ListenerResourceType } from './xds-resource-type/listener-resource-type';
 import { RouteConfigurationResourceType } from './xds-resource-type/route-config-resource-type';
+import { protoDurationToDuration } from './duration';
+import { loadXxhashApi } from './xxhash';
 
 const TRACER_NAME = 'xds_resolver';
 
@@ -208,20 +205,6 @@ function getPredicateForMatcher(routeMatch: RouteMatch__Output): Matcher {
   return new FullMatcher(pathMatcher, headerMatchers, runtimeFraction);
 }
 
-/**
- * Convert a Duration protobuf message object to a Duration object as used in
- * the ServiceConfig definition. The difference is that the protobuf message
- * defines seconds as a long, which is represented as a string in JavaScript,
- * and the one used in the service config defines it as a number.
- * @param duration 
- */
-function protoDurationToDuration(duration: Duration__Output): Duration {
-  return {
-    seconds: Number.parseInt(duration.seconds),
-    nanos: duration.nanos
-  }
-}
-
 function protoDurationToSecondsString(duration: Duration__Output): string {
   return `${duration.seconds + duration.nanos / 1_000_000_000}s`;
 }
@@ -235,7 +218,7 @@ function getDefaultRetryMaxInterval(baseInterval: string): string {
 /**
  * Encode a text string as a valid path of a URI, as specified in RFC-3986 section 3.3
  * @param uriPath A value representing an unencoded URI path
- * @returns 
+ * @returns
  */
 function encodeURIPath(uriPath: string): string {
   return uriPath.replace(/[^A-Za-z0-9._~!$&^()*+,;=/-]/g, substring => encodeURIComponent(substring));
@@ -399,7 +382,11 @@ class XdsResolver implements Resolver {
     }
   }
 
-  private handleRouteConfig(routeConfig: RouteConfiguration__Output) {
+  private async handleRouteConfig(routeConfig: RouteConfiguration__Output) {
+    /* We need to load the xxhash API before this function finishes, because
+     * it is invoked in the config selector, which can be called immediately
+     * after this function returns. */
+    await loadXxhashApi();
     this.latestRouteConfig = routeConfig;
     /* Select the virtual host using the default authority override if it
      * exists, and the channel target otherwise. */
@@ -447,7 +434,7 @@ class XdsResolver implements Resolver {
           }
         }
       }
-      let retryPolicy: RetryPolicy | undefined = undefined; 
+      let retryPolicy: RetryPolicy | undefined = undefined;
       if (EXPERIMENTAL_RETRY) {
         const retryConfig = route.route!.retry_policy ?? virtualHost.retry_policy;
         if (retryConfig) {
@@ -458,10 +445,10 @@ class XdsResolver implements Resolver {
             }
           }
           if (retryableStatusCodes.length > 0) {
-            const baseInterval = retryConfig.retry_back_off?.base_interval ? 
-              protoDurationToSecondsString(retryConfig.retry_back_off.base_interval) : 
+            const baseInterval = retryConfig.retry_back_off?.base_interval ?
+              protoDurationToSecondsString(retryConfig.retry_back_off.base_interval) :
               DEFAULT_RETRY_BASE_INTERVAL;
-            const maxInterval = retryConfig.retry_back_off?.max_interval ? 
+            const maxInterval = retryConfig.retry_back_off?.max_interval ?
               protoDurationToSecondsString(retryConfig.retry_back_off.max_interval) :
               getDefaultRetryMaxInterval(baseInterval);
             retryPolicy = {
@@ -471,6 +458,26 @@ class XdsResolver implements Resolver {
               maxAttempts: (retryConfig.num_retries?.value ?? 1) + 1,
               retryableStatusCodes: retryableStatusCodes
             };
+          }
+        }
+      }
+      const hashPolicies: HashPolicy[] = [];
+      if (EXPERIMENTAL_RING_HASH) {
+        for (const routeHashPolicy of route.route!.hash_policy) {
+          if (routeHashPolicy.policy_specifier === 'header') {
+            const headerPolicy = routeHashPolicy.header!;
+            hashPolicies.push({
+              type: 'HEADER',
+              terminal: routeHashPolicy.terminal,
+              headerName: headerPolicy.header_name,
+              regex: headerPolicy.regex_rewrite?.pattern ? new RE2(headerPolicy.regex_rewrite.pattern.regex, 'ug') : undefined,
+              regexSubstitution: headerPolicy.regex_rewrite?.substitution
+            });
+          } else if (routeHashPolicy.policy_specifier === 'filter_state' && routeHashPolicy.filter_state!.key === 'io.grpc.channel_id') {
+            hashPolicies.push({
+              type: 'CHANNEL_ID',
+              terminal: routeHashPolicy.terminal
+            });
           }
         }
       }
@@ -501,7 +508,7 @@ class XdsResolver implements Resolver {
               }
             }
           }
-          routeAction = new SingleClusterRouteAction(cluster, {name: [], timeout: timeout, retryPolicy: retryPolicy}, extraFilterFactories);
+          routeAction = new SingleClusterRouteAction(cluster, {name: [], timeout: timeout, retryPolicy: retryPolicy}, extraFilterFactories, hashPolicies);
           break;
         }
         case 'weighted_clusters': {
@@ -543,7 +550,7 @@ class XdsResolver implements Resolver {
             }
             weightedClusters.push({name: clusterWeight.name, weight: clusterWeight.weight?.value ?? 0, dynamicFilterFactories: extraFilterFactories});
           }
-          routeAction = new WeightedClusterRouteAction(weightedClusters, route.route!.weighted_clusters!.total_weight?.value ?? 100, {name: [], timeout: timeout, retryPolicy: retryPolicy});
+          routeAction = new WeightedClusterRouteAction(weightedClusters, route.route!.weighted_clusters!.total_weight?.value ?? 100, {name: [], timeout: timeout, retryPolicy: retryPolicy}, hashPolicies);
           break;
         }
         default:
@@ -572,7 +579,7 @@ class XdsResolver implements Resolver {
         this.clusterRefcounts.set(name, {inLastConfig: true, refCount: 0});
       }
     }
-    const configSelector: ConfigSelector = (methodName, metadata) => {
+    const configSelector: ConfigSelector = (methodName, metadata, channelId) => {
       for (const {matcher, action} of matchList) {
         if (matcher.apply(methodName, metadata)) {
           const clusterResult = action.getCluster();
@@ -580,10 +587,16 @@ class XdsResolver implements Resolver {
           const onCommitted = () => {
             this.unrefCluster(clusterResult.name);
           }
+          let hash: string;
+          if (EXPERIMENTAL_RING_HASH) {
+            hash = `${action.getHash(metadata, channelId)}`;
+          } else {
+            hash = '';
+          }
           return {
             methodConfig: clusterResult.methodConfig,
             onCommitted: onCommitted,
-            pickInformation: {cluster: clusterResult.name},
+            pickInformation: {cluster: clusterResult.name, hash: hash},
             status: status.OK,
             dynamicFilterFactories: clusterResult.dynamicFilterFactories
           };
@@ -591,8 +604,8 @@ class XdsResolver implements Resolver {
       }
       return {
         methodConfig: {name: []},
-        // cluster won't be used here, but it's set because of some TypeScript weirdness
-        pickInformation: {cluster: ''},
+        // These fields won't be used here, but they're set because of some TypeScript weirdness
+        pickInformation: {cluster: '', hash: ''},
         status: status.UNAVAILABLE,
         dynamicFilterFactories: []
       };
@@ -602,11 +615,11 @@ class XdsResolver implements Resolver {
       trace(matcher.toString());
       trace('=> ' + action.toString());
     }
-    const clusterConfigMap = new Map<string, {child_policy: LoadBalancingConfig[]}>();
+    const clusterConfigMap: {[key: string]: {child_policy: LoadBalancingConfig[]}} = {};
     for (const clusterName of this.clusterRefcounts.keys()) {
-      clusterConfigMap.set(clusterName, {child_policy: [new CdsLoadBalancingConfig(clusterName)]});
+      clusterConfigMap[clusterName] = {child_policy: [{cds: {cluster: clusterName}}]};
     }
-    const lbPolicyConfig = new XdsClusterManagerLoadBalancingConfig(clusterConfigMap);
+    const lbPolicyConfig = {xds_cluster_manager: {children: clusterConfigMap}};
     const serviceConfig: ServiceConfig = {
       methodConfig: [],
       loadBalancingConfig: [lbPolicyConfig]
@@ -634,7 +647,7 @@ class XdsResolver implements Resolver {
         this.isLdsWatcherActive = true;
 
       } catch (e) {
-        this.reportResolutionError(e.message);
+        this.reportResolutionError((e as Error).message);
       }
     }
   }
@@ -647,7 +660,7 @@ class XdsResolver implements Resolver {
         try {
           this.bootstrapInfo = loadBootstrapInfo();
         } catch (e) {
-          this.reportResolutionError(e.message);
+          this.reportResolutionError((e as Error).message);
         }
         this.startResolution();
       }

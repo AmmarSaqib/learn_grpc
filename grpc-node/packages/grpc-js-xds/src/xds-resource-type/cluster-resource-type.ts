@@ -17,27 +17,27 @@
 
 import { CDS_TYPE_URL, CLUSTER_CONFIG_TYPE_URL, decodeSingleResource } from "../resources";
 import { XdsDecodeContext, XdsDecodeResult, XdsResourceType } from "./xds-resource-type";
-import { experimental } from "@grpc/grpc-js";
+import { LoadBalancingConfig, experimental, logVerbosity } from "@grpc/grpc-js";
 import { XdsServerConfig } from "../xds-bootstrap";
 import { Duration__Output } from "../generated/google/protobuf/Duration";
 import { OutlierDetection__Output } from "../generated/envoy/config/cluster/v3/OutlierDetection";
-import { EXPERIMENTAL_OUTLIER_DETECTION } from "../environment";
+import { EXPERIMENTAL_CUSTOM_LB_CONFIG, EXPERIMENTAL_OUTLIER_DETECTION, EXPERIMENTAL_RING_HASH } from "../environment";
 import { Cluster__Output } from "../generated/envoy/config/cluster/v3/Cluster";
 import { UInt32Value__Output } from "../generated/google/protobuf/UInt32Value";
 import { Any__Output } from "../generated/google/protobuf/Any";
-
+import { Watcher, XdsClient } from "../xds-client";
+import { protoDurationToDuration } from "../duration";
+import { convertToLoadBalancingConfig } from "../lb-policy-registry";
 import SuccessRateEjectionConfig = experimental.SuccessRateEjectionConfig;
 import FailurePercentageEjectionConfig = experimental.FailurePercentageEjectionConfig;
-import { Watcher, XdsClient } from "../xds-client";
+import parseLoadBalancingConfig = experimental.parseLoadBalancingConfig;
 
-export interface OutlierDetectionUpdate {
-  intervalMs: number | null;
-  baseEjectionTimeMs: number | null;
-  maxEjectionTimeMs: number | null;
-  maxEjectionPercent: number | null;
-  successRateConfig: Partial<SuccessRateEjectionConfig> | null;
-  failurePercentageConfig: Partial<FailurePercentageEjectionConfig> | null;
+const TRACER_NAME = 'xds_client';
+
+function trace(text: string): void {
+  experimental.trace(logVerbosity.DEBUG, TRACER_NAME, text);
 }
+
 
 export interface CdsUpdate {
   type: 'AGGREGATE' | 'EDS' | 'LOGICAL_DNS';
@@ -47,29 +47,21 @@ export interface CdsUpdate {
   maxConcurrentRequests?: number;
   edsServiceName?: string;
   dnsHostname?: string;
-  outlierDetectionUpdate?: OutlierDetectionUpdate;
+  lbPolicyConfig: LoadBalancingConfig[];
+  outlierDetectionUpdate?: experimental.OutlierDetectionRawConfig;
 }
 
-function durationToMs(duration: Duration__Output): number {
-  return (Number(duration.seconds) * 1_000 + duration.nanos / 1_000_000) | 0;
-}
-
-function convertOutlierDetectionUpdate(outlierDetection: OutlierDetection__Output | null): OutlierDetectionUpdate | undefined {
+function convertOutlierDetectionUpdate(outlierDetection: OutlierDetection__Output | null): experimental.OutlierDetectionRawConfig | undefined {
   if (!EXPERIMENTAL_OUTLIER_DETECTION) {
     return undefined;
   }
   if (!outlierDetection) {
     /* No-op outlier detection config, with all fields unset. */
     return {
-      intervalMs: null,
-      baseEjectionTimeMs: null,
-      maxEjectionTimeMs: null,
-      maxEjectionPercent: null,
-      successRateConfig: null,
-      failurePercentageConfig: null
+      child_policy: []
     };
   }
-  let successRateConfig: Partial<SuccessRateEjectionConfig> | null = null;
+  let successRateConfig: Partial<SuccessRateEjectionConfig> | undefined = undefined;
   /* Success rate ejection is enabled by default, so we only disable it if
    * enforcing_success_rate is set and it has the value 0 */
   if (!outlierDetection.enforcing_success_rate || outlierDetection.enforcing_success_rate.value > 0) {
@@ -80,7 +72,7 @@ function convertOutlierDetectionUpdate(outlierDetection: OutlierDetection__Outpu
       stdev_factor: outlierDetection.success_rate_stdev_factor?.value
     };
   }
-  let failurePercentageConfig: Partial<FailurePercentageEjectionConfig> | null = null;
+  let failurePercentageConfig: Partial<FailurePercentageEjectionConfig> | undefined = undefined;
   /* Failure percentage ejection is disabled by default, so we only enable it
    * if enforcing_failure_percentage is set and it has a value greater than 0 */
   if (outlierDetection.enforcing_failure_percentage && outlierDetection.enforcing_failure_percentage.value > 0) {
@@ -92,19 +84,19 @@ function convertOutlierDetectionUpdate(outlierDetection: OutlierDetection__Outpu
     }
   }
   return {
-    intervalMs: outlierDetection.interval ? durationToMs(outlierDetection.interval) : null,
-    baseEjectionTimeMs: outlierDetection.base_ejection_time ? durationToMs(outlierDetection.base_ejection_time) : null,
-    maxEjectionTimeMs: outlierDetection.max_ejection_time ? durationToMs(outlierDetection.max_ejection_time) : null,
-    maxEjectionPercent : outlierDetection.max_ejection_percent?.value ?? null,
-    successRateConfig: successRateConfig,
-    failurePercentageConfig: failurePercentageConfig
+    interval: outlierDetection.interval ? protoDurationToDuration(outlierDetection.interval) : undefined,
+    base_ejection_time: outlierDetection.base_ejection_time ? protoDurationToDuration(outlierDetection.base_ejection_time) : undefined,
+    max_ejection_time: outlierDetection.max_ejection_time ? protoDurationToDuration(outlierDetection.max_ejection_time) : undefined,
+    max_ejection_percent: outlierDetection.max_ejection_percent?.value,
+    success_rate_ejection: successRateConfig,
+    failure_percentage_ejection: failurePercentageConfig,
+    child_policy: []
   };
 }
 
-
 export class ClusterResourceType extends XdsResourceType {
   private static singleton: ClusterResourceType = new ClusterResourceType();
-  
+
   private constructor() {
     super();
   }
@@ -124,7 +116,7 @@ export class ClusterResourceType extends XdsResourceType {
     /* The maximum values here come from the official Protobuf documentation:
      * https://developers.google.com/protocol-buffers/docs/reference/google.protobuf#google.protobuf.Duration
      */
-    return Number(duration.seconds) >= 0 && 
+    return Number(duration.seconds) >= 0 &&
            Number(duration.seconds) <= 315_576_000_000 &&
            duration.nanos >= 0 &&
            duration.nanos <= 999_999_999;
@@ -138,7 +130,45 @@ export class ClusterResourceType extends XdsResourceType {
   }
 
   private validateResource(context: XdsDecodeContext, message: Cluster__Output): CdsUpdate | null {
-    if (message.lb_policy !== 'ROUND_ROBIN') {
+    let lbPolicyConfig: LoadBalancingConfig;
+    if (EXPERIMENTAL_CUSTOM_LB_CONFIG && message.load_balancing_policy) {
+      try {
+        lbPolicyConfig = convertToLoadBalancingConfig(message.load_balancing_policy);
+      } catch (e) {
+        trace('LB policy config parsing failed with error ' + e);
+        return null;
+      }
+      try {
+        parseLoadBalancingConfig(lbPolicyConfig);
+      } catch (e) {
+        trace('LB policy config parsing failed with error ' + e);
+        return null;
+      }
+    } else if (message.lb_policy === 'ROUND_ROBIN') {
+      lbPolicyConfig = {
+        xds_wrr_locality: {
+          child_policy: [{round_robin: {}}]
+        }
+      };
+    } else if(EXPERIMENTAL_RING_HASH && message.lb_policy === 'RING_HASH') {
+      if (message.ring_hash_lb_config && message.ring_hash_lb_config.hash_function !== 'XX_HASH') {
+        return null;
+      }
+      const minRingSize = message.ring_hash_lb_config?.minimum_ring_size ? Number(message.ring_hash_lb_config.minimum_ring_size.value) : 1024;
+      if (minRingSize > 8_388_608) {
+        return null;
+      }
+      const maxRingSize = message.ring_hash_lb_config?.maximum_ring_size ? Number(message.ring_hash_lb_config.maximum_ring_size.value) : 8_388_608;
+      if (maxRingSize > 8_388_608) {
+        return null;
+      }
+      lbPolicyConfig = {
+        ring_hash: {
+          min_ring_size: minRingSize,
+          max_ring_size: maxRingSize
+        }
+      };
+    } else {
       return null;
     }
     if (message.lrs_server) {
@@ -183,7 +213,8 @@ export class ClusterResourceType extends XdsResourceType {
         type: 'AGGREGATE',
         name: message.name,
         aggregateChildren: clusterConfig.clusters,
-        outlierDetectionUpdate: convertOutlierDetectionUpdate(null)
+        outlierDetectionUpdate: convertOutlierDetectionUpdate(null),
+        lbPolicyConfig: [lbPolicyConfig]
       };
     } else {
       let maxConcurrentRequests: number | undefined = undefined;
@@ -206,7 +237,8 @@ export class ClusterResourceType extends XdsResourceType {
           maxConcurrentRequests: maxConcurrentRequests,
           edsServiceName: message.eds_cluster_config.service_name === '' ? undefined : message.eds_cluster_config.service_name,
           lrsLoadReportingServer: message.lrs_server ? context.server : undefined,
-          outlierDetectionUpdate: convertOutlierDetectionUpdate(message.outlier_detection)
+          outlierDetectionUpdate: convertOutlierDetectionUpdate(message.outlier_detection),
+          lbPolicyConfig: [lbPolicyConfig]
         }
       } else if (message.type === 'LOGICAL_DNS') {
         if (!message.load_assignment) {
@@ -235,7 +267,8 @@ export class ClusterResourceType extends XdsResourceType {
           maxConcurrentRequests: maxConcurrentRequests,
           dnsHostname: `${socketAddress.address}:${socketAddress.port_value}`,
           lrsLoadReportingServer: message.lrs_server ? context.server : undefined,
-          outlierDetectionUpdate: convertOutlierDetectionUpdate(message.outlier_detection)
+          outlierDetectionUpdate: convertOutlierDetectionUpdate(message.outlier_detection),
+          lbPolicyConfig: [lbPolicyConfig]
         };
       }
     }
@@ -249,6 +282,7 @@ export class ClusterResourceType extends XdsResourceType {
       );
     }
     const message = decodeSingleResource(CDS_TYPE_URL, resource.value);
+    trace('Decoded raw resource of type ' + CDS_TYPE_URL + ': ' + JSON.stringify(message, undefined, 2));
     const validatedMessage = this.validateResource(context, message);
     if (validatedMessage) {
       return {

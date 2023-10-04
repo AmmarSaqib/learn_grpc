@@ -15,10 +15,9 @@
  *
  */
 
-import { connectivityState as ConnectivityState, status as Status, experimental, logVerbosity, Metadata, status } from "@grpc/grpc-js/";
+import { connectivityState as ConnectivityState, status as Status, experimental, logVerbosity, Metadata, status, ChannelOptions } from "@grpc/grpc-js/";
 
-import LoadBalancingConfig = experimental.LoadBalancingConfig;
-import validateLoadBalancingConfig = experimental.validateLoadBalancingConfig;
+import TypedLoadBalancingConfig = experimental.TypedLoadBalancingConfig;
 import LoadBalancer = experimental.LoadBalancer;
 import Picker = experimental.Picker;
 import PickResult = experimental.PickResult;
@@ -26,10 +25,10 @@ import PickArgs = experimental.PickArgs;
 import PickResultType = experimental.PickResultType;
 import UnavailablePicker = experimental.UnavailablePicker;
 import QueuePicker = experimental.QueuePicker;
-import SubchannelAddress = experimental.SubchannelAddress;
+import Endpoint = experimental.Endpoint;
 import ChildLoadBalancerHandler = experimental.ChildLoadBalancerHandler;
-import getFirstUsableConfig = experimental.getFirstUsableConfig;
 import ChannelControlHelper = experimental.ChannelControlHelper;
+import selectLbConfigFromList = experimental.selectLbConfigFromList;
 import registerLoadBalancerType = experimental.registerLoadBalancerType;
 
 const TRACER_NAME = 'xds_cluster_manager';
@@ -40,16 +39,12 @@ function trace(text: string): void {
 
 const TYPE_NAME = 'xds_cluster_manager';
 
-interface ClusterManagerChild {
-  child_policy: LoadBalancingConfig[];
-}
-
-export class XdsClusterManagerLoadBalancingConfig implements LoadBalancingConfig {
+class XdsClusterManagerLoadBalancingConfig implements TypedLoadBalancingConfig {
   getLoadBalancerName(): string {
     return TYPE_NAME;
   }
 
-  constructor(private children: Map<string, ClusterManagerChild>) {}
+  constructor(private children: Map<string, TypedLoadBalancingConfig>) {}
 
   getChildren() {
     return this.children;
@@ -57,9 +52,9 @@ export class XdsClusterManagerLoadBalancingConfig implements LoadBalancingConfig
 
   toJsonObject(): object {
     const childrenField: {[key: string]: object} = {};
-    for (const [childName, childValue] of this.children.entries()) {
+    for (const [childName, childPolicy] of this.children.entries()) {
       childrenField[childName] = {
-        child_policy: childValue.child_policy.map(policy => policy.toJsonObject())
+        child_policy: [childPolicy.toJsonObject()]
       };
     }
     return {
@@ -70,19 +65,20 @@ export class XdsClusterManagerLoadBalancingConfig implements LoadBalancingConfig
   }
 
   static createFromJson(obj: any): XdsClusterManagerLoadBalancingConfig {
-    const childrenMap: Map<string, ClusterManagerChild> = new Map<string, ClusterManagerChild>();
+    const childrenMap: Map<string, TypedLoadBalancingConfig> = new Map<string, TypedLoadBalancingConfig>();
     if (!('children' in obj && obj.children !== null && typeof obj.children === 'object')) {
       throw new Error('xds_cluster_manager config must have a children map');
     }
-    for (const key of obj.children) {
+    for (const key of Object.keys(obj.children)) {
       const childObj = obj.children[key];
       if (!('child_policy' in childObj && Array.isArray(childObj.child_policy))) {
         throw new Error(`xds_cluster_manager child ${key} must have a child_policy array`);
       }
-      const validatedChild = {
-        child_policy: childObj.child_policy.map(validateLoadBalancingConfig)
-      };
-      childrenMap.set(key, validatedChild);
+      const childPolicy = selectLbConfigFromList(childObj.child_policy);
+      if (childPolicy === null) {
+        throw new Error(`xds_cluster_mananger child ${key} has no recognized sucessfully parsed child_policy`);
+      }
+      childrenMap.set(key, childPolicy);
     }
     return new XdsClusterManagerLoadBalancingConfig(childrenMap);
   }
@@ -115,7 +111,7 @@ class XdsClusterManagerPicker implements Picker {
 }
 
 interface XdsClusterManagerChild {
-  updateAddressList(addressList: SubchannelAddress[], lbConfig: ClusterManagerChild, attributes: { [key: string]: unknown; }): void;
+  updateAddressList(endpointList: Endpoint[], childConfig: TypedLoadBalancingConfig, attributes: { [key: string]: unknown; }): void;
   exitIdle(): void;
   resetBackoff(): void;
   destroy(): void;
@@ -135,7 +131,7 @@ class XdsClusterManager implements LoadBalancer {
         updateState: (connectivityState: ConnectivityState, picker: Picker) => {
           this.updateState(connectivityState, picker);
         },
-      }));
+      }), parent.options);
 
       this.picker = new QueuePicker(this.childBalancer);
     }
@@ -146,11 +142,8 @@ class XdsClusterManager implements LoadBalancer {
       this.picker = picker;
       this.parent.maybeUpdateState();
     }
-    updateAddressList(addressList: SubchannelAddress[], lbConfig: ClusterManagerChild, attributes: { [key: string]: unknown; }): void {
-      const childConfig = getFirstUsableConfig(lbConfig.child_policy);
-      if (childConfig !== null) {
-        this.childBalancer.updateAddressList(addressList, childConfig, attributes);
-      }
+    updateAddressList(endpointList: Endpoint[], childConfig: TypedLoadBalancingConfig, attributes: { [key: string]: unknown; }): void {
+      this.childBalancer.updateAddressList(endpointList, childConfig, attributes);
     }
     exitIdle(): void {
       this.childBalancer.exitIdle();
@@ -174,7 +167,7 @@ class XdsClusterManager implements LoadBalancer {
   // Shutdown is a placeholder value that will never appear in normal operation.
   private currentState: ConnectivityState = ConnectivityState.SHUTDOWN;
   private updatesPaused = false;
-  constructor(private channelControlHelper: ChannelControlHelper) {}
+  constructor(private channelControlHelper: ChannelControlHelper, private options: ChannelOptions) {}
 
   private maybeUpdateState() {
     if (!this.updatesPaused) {
@@ -211,38 +204,10 @@ class XdsClusterManager implements LoadBalancer {
     } else {
       connectivityState = ConnectivityState.TRANSIENT_FAILURE;
     }
-    /* For each of the states CONNECTING, IDLE, and TRANSIENT_FAILURE, there is
-     * exactly one corresponding picker, so if the state is one of those and
-     * that does not change, no new information is provided by passing the
-     * new state upward. */
-    if (connectivityState === this.currentState && connectivityState !== ConnectivityState.READY) {
-      return;
-    }
-    let picker: Picker;
-
-    switch (connectivityState) {
-      case ConnectivityState.READY:
-        picker = new XdsClusterManagerPicker(pickerMap);
-        break;
-      case ConnectivityState.CONNECTING:
-      case ConnectivityState.IDLE:
-        picker = new QueuePicker(this);
-        break;
-      default:
-        picker = new UnavailablePicker({
-          code: Status.UNAVAILABLE,
-          details: 'xds_cluster_manager: all children report state TRANSIENT_FAILURE',
-          metadata: new Metadata()
-        });
-    }
-    trace(
-        'Transitioning to ' +
-        ConnectivityState[connectivityState]
-    );
-    this.channelControlHelper.updateState(connectivityState, picker);
+    this.channelControlHelper.updateState(connectivityState, new XdsClusterManagerPicker(pickerMap));
   }
-  
-  updateAddressList(addressList: SubchannelAddress[], lbConfig: LoadBalancingConfig, attributes: { [key: string]: unknown; }): void {
+
+  updateAddressList(endpointList: Endpoint[], lbConfig: TypedLoadBalancingConfig, attributes: { [key: string]: unknown; }): void {
     if (!(lbConfig instanceof XdsClusterManagerLoadBalancingConfig)) {
       // Reject a config of the wrong type
       trace('Discarding address list update with unrecognized config ' + JSON.stringify(lbConfig.toJsonObject(), undefined, 2));
@@ -266,7 +231,7 @@ class XdsClusterManager implements LoadBalancer {
     for (const [name, childConfig] of configChildren.entries()) {
       if (!this.children.has(name)) {
         const newChild = new this.XdsClusterManagerChildImpl(this, name);
-        newChild.updateAddressList(addressList, childConfig, attributes);
+        newChild.updateAddressList(endpointList, childConfig, attributes);
         this.children.set(name, newChild);
       }
     }

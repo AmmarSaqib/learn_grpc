@@ -15,15 +15,16 @@
  *
  */
 
-import { experimental, logVerbosity, status as Status, Metadata, connectivityState } from "@grpc/grpc-js";
+import { experimental, logVerbosity, status as Status, Metadata, connectivityState, ChannelOptions } from "@grpc/grpc-js";
 import { validateXdsServerConfig, XdsServerConfig } from "./xds-bootstrap";
-import { getSingletonXdsClient, XdsClient, XdsClusterDropStats } from "./xds-client";
+import { getSingletonXdsClient, XdsClient, XdsClusterDropStats, XdsClusterLocalityStats } from "./xds-client";
+import { LocalityEndpoint } from "./load-balancer-priority";
 
-import LoadBalancingConfig = experimental.LoadBalancingConfig;
-import validateLoadBalancingConfig = experimental.validateLoadBalancingConfig;
 import LoadBalancer = experimental.LoadBalancer;
 import registerLoadBalancerType = experimental.registerLoadBalancerType;
-import SubchannelAddress = experimental.SubchannelAddress;
+import Endpoint = experimental.Endpoint;
+import endpointHasAddress = experimental.endpointHasAddress;
+import subchannelAddressToString = experimental.subchannelAddressToString;
 import Picker = experimental.Picker;
 import PickArgs = experimental.PickArgs;
 import PickResult = experimental.PickResult;
@@ -31,7 +32,11 @@ import PickResultType = experimental.PickResultType;
 import ChannelControlHelper = experimental.ChannelControlHelper;
 import ChildLoadBalancerHandler = experimental.ChildLoadBalancerHandler;
 import createChildChannelControlHelper = experimental.createChildChannelControlHelper;
-import getFirstUsableConfig = experimental.getFirstUsableConfig;
+import TypedLoadBalancingConfig = experimental.TypedLoadBalancingConfig;
+import selectLbConfigFromList = experimental.selectLbConfigFromList;
+import SubchannelInterface = experimental.SubchannelInterface;
+import BaseSubchannelWrapper = experimental.BaseSubchannelWrapper;
+import { Locality__Output } from "./generated/envoy/config/core/v3/Locality";
 
 const TRACER_NAME = 'xds_cluster_impl';
 
@@ -58,7 +63,7 @@ function validateDropCategory(obj: any): DropCategory {
   return obj;
 }
 
-export class XdsClusterImplLoadBalancingConfig implements LoadBalancingConfig {
+class XdsClusterImplLoadBalancingConfig implements TypedLoadBalancingConfig {
   private maxConcurrentRequests: number;
   getLoadBalancerName(): string {
     return TYPE_NAME;
@@ -67,21 +72,17 @@ export class XdsClusterImplLoadBalancingConfig implements LoadBalancingConfig {
     const jsonObj: {[key: string]: any} = {
       cluster: this.cluster,
       drop_categories: this.dropCategories,
-      child_policy: this.childPolicy.map(policy => policy.toJsonObject()),
-      max_concurrent_requests: this.maxConcurrentRequests
+      child_policy: [this.childPolicy.toJsonObject()],
+      max_concurrent_requests: this.maxConcurrentRequests,
+      eds_service_name: this.edsServiceName,
+      lrs_load_reporting_server: this.lrsLoadReportingServer,
     };
-    if (this.edsServiceName !== undefined) {
-      jsonObj.eds_service_name = this.edsServiceName;
-    }
-    if (this.lrsLoadReportingServer !== undefined) {
-      jsonObj.lrs_load_reporting_server_name = this.lrsLoadReportingServer;
-    }
     return {
       [TYPE_NAME]: jsonObj
     };
   }
 
-  constructor(private cluster: string, private dropCategories: DropCategory[], private childPolicy: LoadBalancingConfig[], private edsServiceName?: string, private lrsLoadReportingServer?: XdsServerConfig, maxConcurrentRequests?: number) {
+  constructor(private cluster: string, private dropCategories: DropCategory[], private childPolicy: TypedLoadBalancingConfig, private edsServiceName: string, private lrsLoadReportingServer?: XdsServerConfig, maxConcurrentRequests?: number) {
     this.maxConcurrentRequests = maxConcurrentRequests ?? DEFAULT_MAX_CONCURRENT_REQUESTS;
   }
 
@@ -113,10 +114,10 @@ export class XdsClusterImplLoadBalancingConfig implements LoadBalancingConfig {
     if (!('cluster' in obj && typeof obj.cluster === 'string')) {
       throw new Error('xds_cluster_impl config must have a string field cluster');
     }
-    if ('eds_service_name' in obj && !(obj.eds_service_name === undefined || typeof obj.eds_service_name === 'string')) {
-      throw new Error('xds_cluster_impl config eds_service_name field must be a string if provided');
+    if (!('eds_service_name' in obj && typeof obj.eds_service_name === 'string')) {
+      throw new Error('xds_cluster_impl config must have a string field eds_service_name');
     }
-    if ('max_concurrent_requests' in obj && (!obj.max_concurrent_requests === undefined || typeof obj.max_concurrent_requests === 'number')) {
+    if ('max_concurrent_requests' in obj && !(obj.max_concurrent_requests === undefined || typeof obj.max_concurrent_requests === 'number')) {
       throw new Error('xds_cluster_impl config max_concurrent_requests must be a number if provided');
     }
     if (!('drop_categories' in obj && Array.isArray(obj.drop_categories))) {
@@ -125,7 +126,15 @@ export class XdsClusterImplLoadBalancingConfig implements LoadBalancingConfig {
     if (!('child_policy' in obj && Array.isArray(obj.child_policy))) {
       throw new Error('xds_cluster_impl config must have an array field child_policy');
     }
-    return new XdsClusterImplLoadBalancingConfig(obj.cluster, obj.drop_categories.map(validateDropCategory), obj.child_policy.map(validateLoadBalancingConfig), obj.eds_service_name, obj.lrs_load_reporting_server ? validateXdsServerConfig(obj.lrs_load_reporting_server) : undefined, obj.max_concurrent_requests);
+    const childConfig = selectLbConfigFromList(obj.child_policy);
+    if (!childConfig) {
+      throw new Error('xds_cluster_impl config child_policy parsing failed');
+    }
+    let lrsServer: XdsServerConfig | undefined = undefined;
+    if (obj.lrs_load_reporting_server) {
+      lrsServer = validateXdsServerConfig(obj.lrs_load_reporting_server)
+    }
+    return new XdsClusterImplLoadBalancingConfig(obj.cluster, obj.drop_categories.map(validateDropCategory), childConfig, obj.eds_service_name, lrsServer, obj.max_concurrent_requests);
   }
 }
 
@@ -153,7 +162,25 @@ class CallCounterMap {
 
 const callCounterMap = new CallCounterMap();
 
-class DropPicker implements Picker {
+class LocalitySubchannelWrapper extends BaseSubchannelWrapper implements SubchannelInterface {
+  constructor(child: SubchannelInterface, private statsObject: XdsClusterLocalityStats | null) {
+    super(child);
+  }
+
+  getStatsObject() {
+    return this.statsObject;
+  }
+
+  getWrappedSubchannel(): SubchannelInterface {
+    return this.child;
+  }
+}
+
+/**
+ * This picker is responsible for implementing the drop configuration, and for
+ * recording drop stats and per-locality stats.
+ */
+class XdsClusterImplPicker implements Picker {
   constructor(private originalPicker: Picker, private callCounterMapKey: string, private maxConcurrentRequests: number, private dropCategories: DropCategory[], private clusterDropStats: XdsClusterDropStats | null) {}
 
   private checkForMaxConcurrentRequestsDrop(): boolean {
@@ -183,16 +210,19 @@ class DropPicker implements Picker {
     }
     if (details === null) {
       const originalPick = this.originalPicker.pick(pickArgs);
+      const pickSubchannel = originalPick.subchannel ? (originalPick.subchannel as LocalitySubchannelWrapper) : null;
       return {
         pickResultType: originalPick.pickResultType,
         status: originalPick.status,
-        subchannel: originalPick.subchannel,
+        subchannel: pickSubchannel?.getWrappedSubchannel() ?? null,
         onCallStarted: () => {
           originalPick.onCallStarted?.();
+          pickSubchannel?.getStatsObject()?.addCallStarted();
           callCounterMap.startCall(this.callCounterMapKey);
         },
         onCallEnded: status => {
           originalPick.onCallEnded?.(status);
+          pickSubchannel?.getStatsObject()?.addCallFinished(status !== Status.OK)
           callCounterMap.endCall(this.callCounterMapKey);
         }
       };
@@ -218,31 +248,59 @@ function getCallCounterMapKey(cluster: string, edsServiceName?: string): string 
 
 class XdsClusterImplBalancer implements LoadBalancer {
   private childBalancer: ChildLoadBalancerHandler;
+  private lastestEndpointList: Endpoint[] | null = null;
   private latestConfig: XdsClusterImplLoadBalancingConfig | null = null;
   private clusterDropStats: XdsClusterDropStats | null = null;
   private xdsClient: XdsClient | null = null;
 
-  constructor(private readonly channelControlHelper: ChannelControlHelper) {
+  constructor(private readonly channelControlHelper: ChannelControlHelper, options: ChannelOptions) {
       this.childBalancer = new ChildLoadBalancerHandler(createChildChannelControlHelper(channelControlHelper, {
+        createSubchannel: (subchannelAddress, subchannelArgs) => {
+          if (!this.xdsClient || !this.latestConfig || !this.lastestEndpointList) {
+            throw new Error('xds_cluster_impl: invalid state: createSubchannel called with xdsClient or latestConfig not populated');
+          }
+          const wrapperChild = channelControlHelper.createSubchannel(subchannelAddress, subchannelArgs);
+          let locality: Locality__Output | null = null;
+          for (const endpoint of this.lastestEndpointList) {
+            if (endpointHasAddress(endpoint, subchannelAddress)) {
+              locality = (endpoint as LocalityEndpoint).locality;
+            }
+          }
+          if (locality === null) {
+            trace('Not reporting load for address ' + subchannelAddressToString(subchannelAddress) + ' because it has unknown locality.');
+            return wrapperChild;
+          }
+          const lrsServer = this.latestConfig.getLrsLoadReportingServer();
+          let statsObj: XdsClusterLocalityStats | null = null;
+          if (lrsServer) {
+            statsObj = this.xdsClient.addClusterLocalityStats(
+              lrsServer,
+              this.latestConfig.getCluster(),
+              this.latestConfig.getEdsServiceName(),
+              locality
+            );
+          }
+          return new LocalitySubchannelWrapper(wrapperChild, statsObj);
+        },
         updateState: (connectivityState, originalPicker) => {
           if (this.latestConfig === null) {
             channelControlHelper.updateState(connectivityState, originalPicker);
           } else {
-            const picker = new DropPicker(originalPicker, getCallCounterMapKey(this.latestConfig.getCluster(), this.latestConfig.getEdsServiceName()), this.latestConfig.getMaxConcurrentRequests(), this.latestConfig.getDropCategories(), this.clusterDropStats);
+            const picker = new XdsClusterImplPicker(originalPicker, getCallCounterMapKey(this.latestConfig.getCluster(), this.latestConfig.getEdsServiceName()), this.latestConfig.getMaxConcurrentRequests(), this.latestConfig.getDropCategories(), this.clusterDropStats);
             channelControlHelper.updateState(connectivityState, picker);
           }
         }
-      }));
+      }), options);
     }
-  updateAddressList(addressList: SubchannelAddress[], lbConfig: LoadBalancingConfig, attributes: { [key: string]: unknown; }): void {
+  updateAddressList(endpointList: Endpoint[], lbConfig: TypedLoadBalancingConfig, attributes: { [key: string]: unknown; }): void {
     if (!(lbConfig instanceof XdsClusterImplLoadBalancingConfig)) {
       trace('Discarding address list update with unrecognized config ' + JSON.stringify(lbConfig.toJsonObject(), undefined, 2));
       return;
     }
     trace('Received update with config: ' + JSON.stringify(lbConfig, undefined, 2));
+    this.lastestEndpointList = endpointList;
     this.latestConfig = lbConfig;
     this.xdsClient = attributes.xdsClient as XdsClient;
-
     if (lbConfig.getLrsLoadReportingServer()) {
       this.clusterDropStats = this.xdsClient.addClusterDropStats(
         lbConfig.getLrsLoadReportingServer()!,
@@ -251,7 +309,7 @@ class XdsClusterImplBalancer implements LoadBalancer {
       );
     }
 
-    this.childBalancer.updateAddressList(addressList, getFirstUsableConfig(lbConfig.getChildPolicy(), true), attributes);
+    this.childBalancer.updateAddressList(endpointList, lbConfig.getChildPolicy(), attributes);
   }
   exitIdle(): void {
     this.childBalancer.exitIdle();

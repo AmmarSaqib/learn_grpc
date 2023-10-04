@@ -1,5 +1,6 @@
 var grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
+const { timeout } = require('async');
 const path = require('path');
 const { struct } = require('pb-util');
 
@@ -18,8 +19,10 @@ const payload = {
     })
 }
 
+var timeoutsec = new Date().setSeconds(new Date().getSeconds() + 3)
+
 // Sending message
-client.SendData(payload, (err, response) => {
+client.SendData(payload, { deadline: timeoutsec }, (err, response) => {
     if (err) throw err
     console.log(response)
 })

@@ -166,7 +166,7 @@ export class InternalChannel {
    * the invariant is that callRefTimer is reffed if and only if pickQueue
    * is non-empty.
    */
-  private readonly callRefTimer: NodeJS.Timer;
+  private readonly callRefTimer: NodeJS.Timeout;
   private configSelector: ConfigSelector | null = null;
   /**
    * This is the error from the name resolver if it failed most recently. It
@@ -182,7 +182,7 @@ export class InternalChannel {
     new Set();
 
   private callCount = 0;
-  private idleTimer: NodeJS.Timer | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
   private readonly idleTimeoutMs: number;
 
   // Channelz info
@@ -192,6 +192,15 @@ export class InternalChannel {
   private readonly channelzTrace: ChannelzTrace;
   private readonly callTracker = new ChannelzCallTracker();
   private readonly childrenTracker = new ChannelzChildrenTracker();
+
+  /**
+   * Randomly generated ID to be passed to the config selector, for use by
+   * ring_hash in xDS. An integer distributed approximately uniformly between
+   * 0 and MAX_SAFE_INTEGER.
+   */
+  private readonly randomChannelId = Math.floor(
+    Math.random() * Number.MAX_SAFE_INTEGER
+  );
 
   constructor(
     target: string,
@@ -528,7 +537,7 @@ export class InternalChannel {
     if (this.configSelector) {
       return {
         type: 'SUCCESS',
-        config: this.configSelector(method, metadata),
+        config: this.configSelector(method, metadata, this.randomChannelId),
       };
     } else {
       if (this.currentResolutionError) {

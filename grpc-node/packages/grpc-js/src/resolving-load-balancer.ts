@@ -18,8 +18,8 @@
 import {
   ChannelControlHelper,
   LoadBalancer,
-  LoadBalancingConfig,
-  getFirstUsableConfig,
+  TypedLoadBalancingConfig,
+  selectLbConfigFromList,
 } from './load-balancer';
 import { ServiceConfig, validateServiceConfig } from './service-config';
 import { ConnectivityState } from './connectivity-state';
@@ -32,7 +32,7 @@ import { StatusObject } from './call-interface';
 import { Metadata } from './metadata';
 import * as logging from './logging';
 import { LogVerbosity } from './constants';
-import { SubchannelAddress } from './subchannel-address';
+import { Endpoint } from './subchannel-address';
 import { GrpcUri, uriToString } from './uri-parser';
 import { ChildLoadBalancerHandler } from './load-balancer-child-handler';
 import { ChannelOptions } from './channel-options';
@@ -149,35 +149,38 @@ export class ResolvingLoadBalancer implements LoadBalancer {
       };
     }
     this.updateState(ConnectivityState.IDLE, new QueuePicker(this));
-    this.childLoadBalancer = new ChildLoadBalancerHandler({
-      createSubchannel:
-        channelControlHelper.createSubchannel.bind(channelControlHelper),
-      requestReresolution: () => {
-        /* If the backoffTimeout is running, we're still backing off from
-         * making resolve requests, so we shouldn't make another one here.
-         * In that case, the backoff timer callback will call
-         * updateResolution */
-        if (this.backoffTimeout.isRunning()) {
-          this.continueResolving = true;
-        } else {
-          this.updateResolution();
-        }
+    this.childLoadBalancer = new ChildLoadBalancerHandler(
+      {
+        createSubchannel:
+          channelControlHelper.createSubchannel.bind(channelControlHelper),
+        requestReresolution: () => {
+          /* If the backoffTimeout is running, we're still backing off from
+           * making resolve requests, so we shouldn't make another one here.
+           * In that case, the backoff timer callback will call
+           * updateResolution */
+          if (this.backoffTimeout.isRunning()) {
+            this.continueResolving = true;
+          } else {
+            this.updateResolution();
+          }
+        },
+        updateState: (newState: ConnectivityState, picker: Picker) => {
+          this.latestChildState = newState;
+          this.latestChildPicker = picker;
+          this.updateState(newState, picker);
+        },
+        addChannelzChild:
+          channelControlHelper.addChannelzChild.bind(channelControlHelper),
+        removeChannelzChild:
+          channelControlHelper.removeChannelzChild.bind(channelControlHelper),
       },
-      updateState: (newState: ConnectivityState, picker: Picker) => {
-        this.latestChildState = newState;
-        this.latestChildPicker = picker;
-        this.updateState(newState, picker);
-      },
-      addChannelzChild:
-        channelControlHelper.addChannelzChild.bind(channelControlHelper),
-      removeChannelzChild:
-        channelControlHelper.removeChannelzChild.bind(channelControlHelper),
-    });
+      channelOptions
+    );
     this.innerResolver = createResolver(
       target,
       {
         onSuccessfulResolution: (
-          addressList: SubchannelAddress[],
+          endpointList: Endpoint[],
           serviceConfig: ServiceConfig | null,
           serviceConfigError: ServiceError | null,
           configSelector: ConfigSelector | null,
@@ -211,7 +214,7 @@ export class ResolvingLoadBalancer implements LoadBalancer {
           }
           const workingConfigList =
             workingServiceConfig?.loadBalancingConfig ?? [];
-          const loadBalancingConfig = getFirstUsableConfig(
+          const loadBalancingConfig = selectLbConfigFromList(
             workingConfigList,
             true
           );
@@ -226,7 +229,7 @@ export class ResolvingLoadBalancer implements LoadBalancer {
             return;
           }
           this.childLoadBalancer.updateAddressList(
-            addressList,
+            endpointList,
             loadBalancingConfig,
             attributes
           );
@@ -261,7 +264,11 @@ export class ResolvingLoadBalancer implements LoadBalancer {
   private updateResolution() {
     this.innerResolver.updateResolution();
     if (this.currentState === ConnectivityState.IDLE) {
-      this.updateState(ConnectivityState.CONNECTING, new QueuePicker(this));
+      /* this.latestChildPicker is initialized as new QueuePicker(this), which
+       * is an appropriate value here if the child LB policy is unset.
+       * Otherwise, we want to delegate to the child here, in case that
+       * triggers something. */
+      this.updateState(ConnectivityState.CONNECTING, this.latestChildPicker);
     }
     this.backoffTimeout.runOnce();
   }
@@ -276,7 +283,7 @@ export class ResolvingLoadBalancer implements LoadBalancer {
     );
     // Ensure that this.exitIdle() is called by the picker
     if (connectivityState === ConnectivityState.IDLE) {
-      picker = new QueuePicker(this);
+      picker = new QueuePicker(this, picker);
     }
     this.currentState = connectivityState;
     this.channelControlHelper.updateState(connectivityState, picker);
@@ -307,8 +314,8 @@ export class ResolvingLoadBalancer implements LoadBalancer {
   }
 
   updateAddressList(
-    addressList: SubchannelAddress[],
-    lbConfig: LoadBalancingConfig | null
+    endpointList: Endpoint[],
+    lbConfig: TypedLoadBalancingConfig | null
   ): never {
     throw new Error('updateAddressList not supported on ResolvingLoadBalancer');
   }
